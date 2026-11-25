@@ -24,10 +24,25 @@ struct InstagramWebView: UIViewRepresentable {
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = true   // swipe from the edge to go back
-        webView.isOpaque = false
+        webView.allowsLinkPreview = false                    // no long-press previews popping up
+        webView.isOpaque = true                              // opaque views draw faster
         webView.backgroundColor = .systemBackground
         webView.scrollView.backgroundColor = .systemBackground
-        webView.load(URLRequest(url: startURL))
+        webView.underPageBackgroundColor = .systemBackground
+
+        // Block Instagram/Facebook tracking & logging requests before the first load.
+        let request = URLRequest(url: startURL)
+        WKContentRuleListStore.default().compileContentRuleList(
+            forIdentifier: "FocusFeedBlocklist",
+            encodedContentRuleList: Blocklist.rules
+        ) { ruleList, _ in
+            DispatchQueue.main.async {
+                if let ruleList = ruleList {
+                    webView.configuration.userContentController.add(ruleList)
+                }
+                webView.load(request)
+            }
+        }
         return webView
     }
 

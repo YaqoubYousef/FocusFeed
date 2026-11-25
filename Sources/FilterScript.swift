@@ -1,9 +1,16 @@
 /// JavaScript injected into every Instagram page before it loads.
 /// Edit the settings at the top of the script to change what gets hidden.
+///
+/// Performance rules this script follows:
+/// - No non-passive touch/scroll listeners on the page (those make every scroll wait for JS).
+/// - No polling of the whole page: only newly added elements are checked, in batches.
+/// - No expensive CSS selectors such as :has().
 enum FilterScript {
     static let source = #"""
 (function () {
   'use strict';
+  if (window.__focusFeed) return;
+  window.__focusFeed = true;
 
   // ---- Settings -----------------------------------------------------------
   const BLOCK_EXPLORE = false;      // true = also block the Explore page (mostly reels)
@@ -18,50 +25,29 @@ enum FilterScript {
   let allowedReel = null;
   let onReel = false;
 
-  // ---- Styles -------------------------------------------------------------
+  // ---- Styles (cheap selectors only) --------------------------------------
   const css = `
     a[href="/reels/"], a[href^="/reels/?"] { display: none !important; }
-    ${HIDE_FEED_REELS ? 'html.nr-home article:has(a[href*="/reel/"]) { display: none !important; }' : ''}
+    .ff-hidden { display: none !important; }
+    .ff-locked { overflow: hidden !important; overscroll-behavior: none !important;
+                 touch-action: pan-x pinch-zoom !important; }
     ${BLOCK_EXPLORE ? 'a[href="/explore/"] { display: none !important; }' : ''}
   `;
   function injectStyle() {
-    if (document.getElementById('nr-style')) return;
+    if (document.getElementById('ff-style')) return;
     const style = document.createElement('style');
-    style.id = 'nr-style';
+    style.id = 'ff-style';
     style.textContent = css;
     (document.head || document.documentElement).appendChild(style);
   }
 
-  // ---- "Open in app" banners ---------------------------------------------
-  const APP_LINK = /apps\.apple\.com|itunes\.apple\.com|instagram:\/\/|app\.link|\/download\/?$/i;
-  const APP_TEXT = /^(open|use|get|switch to)( the| in)?( instagram)?( app)?$|^open instagram$/i;
-  const NAV_LINKS = 'a[href^="/direct"], a[href="/explore/"], a[href="/accounts/activity/"], nav';
-
-  function hideAppBanner() {
-    document.querySelectorAll('a, button, [role="button"]').forEach((el) => {
-      if (el.dataset.nrChecked) return;
-      el.dataset.nrChecked = '1';
-      const text = (el.textContent || '').trim();
-      const href = el.getAttribute('href') || '';
-      if (!APP_LINK.test(href) && !(text.length < 30 && APP_TEXT.test(text))) return;
-      let box = el;
-      while (box.parentElement && box.parentElement !== document.body) {
-        const p = box.parentElement;
-        if (p.offsetHeight > 100 || p.querySelector(NAV_LINKS)) break;
-        box = p;
-      }
-      box.style.setProperty('display', 'none', 'important');
-    });
-  }
-
   // ---- Navigation guard ---------------------------------------------------
-  function check() {
+  function onNavigate() {
     injectStyle();
     const path = location.pathname;
     if (path === lastPath) return;
     const prev = lastPath;
     lastPath = path;
-    locks = new WeakMap();   // new page: forget scroll locks from the previous one
 
     if (REELS_TAB.test(path) || (BLOCK_EXPLORE && path.startsWith('/explore'))) {
       location.replace('/');
@@ -81,94 +67,158 @@ enum FilterScript {
     } else {
       allowedReel = null;
     }
-
     onReel = !!m;
-    const root = document.documentElement;
-    root.classList.toggle('nr-reel', onReel);
-    root.classList.toggle('nr-home', path === '/');
+
+    if (HIDE_FEED_REELS && path === '/') hideFeedReels(document);
+    scheduleScan();
   }
 
-  // ---- Block swiping in the reel viewer ----------------------------------
-  // Works on what is on screen, not the page address: a swipe is blocked when the thing it
-  // would scroll contains a full-screen video (the reel viewer, wherever Instagram opens it).
+  // React to Instagram's in-app navigation immediately instead of polling fast.
+  ['pushState', 'replaceState'].forEach((fn) => {
+    const orig = history[fn];
+    history[fn] = function () {
+      const result = orig.apply(this, arguments);
+      setTimeout(onNavigate, 0);
+      return result;
+    };
+  });
+  window.addEventListener('popstate', onNavigate);
+
+  // ---- Feed reels and "open in app" banners (new elements only) -----------
+  function hideFeedReels(root) {
+    if (location.pathname !== '/') return;          // never on the page of a reel sent to you
+    const links = root.querySelectorAll ? root.querySelectorAll('a[href*="/reel/"]') : [];
+    for (const a of links) {
+      const art = a.closest('article');
+      if (art) art.classList.add('ff-hidden');
+    }
+    if (root.matches && root.matches('a[href*="/reel/"]')) {
+      const art = root.closest('article');
+      if (art) art.classList.add('ff-hidden');
+    }
+  }
+
+  const APP_LINK = /apps\.apple\.com|itunes\.apple\.com|instagram:\/\/|app\.link|\/download\/?$/i;
+  const APP_TEXT = /^(open|use|get|switch to)( the| in)?( instagram)?( app)?$|^open instagram$/i;
+  const NAV_LINKS = 'a[href^="/direct"], a[href="/explore/"], a[href="/accounts/activity/"], nav';
+
+  function hideBannerButton(el) {
+    const text = (el.textContent || '').trim();
+    const href = el.getAttribute('href') || '';
+    if (!APP_LINK.test(href) && !(text.length < 30 && APP_TEXT.test(text))) return;
+    let box = el;
+    while (box.parentElement && box.parentElement !== document.body) {
+      const p = box.parentElement;
+      if (p.offsetHeight > 100 || p.querySelector(NAV_LINKS)) break;
+      box = p;
+    }
+    box.classList.add('ff-hidden');
+  }
+
+  function hideBanners(root) {
+    if (root.matches && root.matches('a, button, [role="button"]')) hideBannerButton(root);
+    if (root.querySelectorAll) root.querySelectorAll('a, button, [role="button"]').forEach(hideBannerButton);
+  }
+
+  // ---- Reel viewer lock ---------------------------------------------------
+  // When a full-screen video is on screen, the area that would scroll to the next reel is
+  // locked with CSS (no JS in the scroll path), so swiping does nothing.
   const vh = () => window.innerHeight || document.documentElement.clientHeight;
   const docScroller = () => document.scrollingElement || document.documentElement;
 
-  function isTyping(el) {
-    return !!(el && el.closest && el.closest('textarea, input, [contenteditable="true"]'));
-  }
-
   function scrollParent(el) {
-    for (let n = el; n && n.nodeType === 1 && n !== document.body && n !== document.documentElement; n = n.parentElement) {
+    for (let n = el.parentElement; n && n !== document.body && n !== document.documentElement; n = n.parentElement) {
       const oy = getComputedStyle(n).overflowY;
       if ((oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight + 1) return n;
     }
     return docScroller();
   }
 
-  function hasFullScreenVideo(root) {
-    for (const v of root.querySelectorAll('video')) {
+  function findReelScroller() {
+    const h = vh();
+    for (const v of document.getElementsByTagName('video')) {
       const r = v.getBoundingClientRect();
-      if (r.height >= vh() * 0.75 && r.bottom > 0 && r.top < vh()) return true;
+      if (r.height >= h * 0.75 && r.bottom > 0 && r.top < h) return scrollParent(v);
     }
-    return false;
+    return onReel ? docScroller() : null;
   }
 
-  function isReelScroller(sc) {
-    if (sc === docScroller()) return onReel || hasFullScreenVideo(document);
-    return hasFullScreenVideo(sc);
+  let locked = null;
+  let lockPos = 0;
+
+  function lockTargets(el) {
+    return el === docScroller() ? [document.documentElement, document.body] : [el];
   }
 
-  let locks = new WeakMap();   // scroller -> scroll position it must stay at
-  let gesture = null;
+  function setLock(el) {
+    if (el === locked) return;
+    if (locked) lockTargets(locked).forEach((t) => t && t.classList.remove('ff-locked'));
+    locked = el;
+    if (el) {
+      lockPos = el.scrollTop;
+      lockTargets(el).forEach((t) => t && t.classList.add('ff-locked'));
+    }
+  }
 
-  window.addEventListener('touchstart', (e) => {
-    const t = e.touches[0];
-    if (!t) return;
-    const sc = scrollParent(e.target);
-    const block = !isTyping(e.target) && isReelScroller(sc);
-    if (block) { if (!locks.has(sc)) locks.set(sc, sc.scrollTop); }
-    else locks.delete(sc);
-    gesture = { x: t.clientX, y: t.clientY, block, vertical: false };
+  // Momentum or code that still moves a locked viewer gets put back (passive, cheap).
+  document.addEventListener('scroll', (e) => {
+    if (!locked) return;
+    const el = e.target === document ? docScroller() : e.target;
+    if (el === locked && Math.abs(el.scrollTop - lockPos) > 2) el.scrollTop = lockPos;
   }, { capture: true, passive: true });
 
-  window.addEventListener('touchmove', (e) => {
-    if (!gesture || !gesture.block) return;
+  // Stop Instagram's own JS swipe handling while locked (passive: never delays scrolling).
+  let gesture = null;
+  window.addEventListener('touchstart', (e) => {
+    if (!locked) { gesture = null; return; }
     const t = e.touches[0];
-    if (!t) return;
-    if (Math.abs(t.clientY - gesture.y) > Math.abs(t.clientX - gesture.x)) {
-      gesture.vertical = true;
-      e.preventDefault();               // stop the native scroll
-      e.stopImmediatePropagation();     // stop Instagram's own swipe handling
-    }
-  }, { capture: true, passive: false });
+    const inLocked = locked === docScroller() || locked.contains(e.target);
+    gesture = t && inLocked ? { x: t.clientX, y: t.clientY, vertical: false } : null;
+  }, { capture: true, passive: true });
 
-  ['touchend', 'pointermove', 'pointerup'].forEach((type) => {
+  ['touchmove', 'touchend', 'pointermove', 'pointerup'].forEach((type) => {
     window.addEventListener(type, (e) => {
-      if (gesture && gesture.block && gesture.vertical) e.stopImmediatePropagation();
-    }, true);
+      if (!gesture) return;
+      if (type === 'touchmove' && e.touches[0]) {
+        const t = e.touches[0];
+        if (Math.abs(t.clientY - gesture.y) > Math.abs(t.clientX - gesture.x) + 4) gesture.vertical = true;
+      }
+      if (gesture.vertical) e.stopImmediatePropagation();
+    }, { capture: true, passive: true });
   });
 
-  // Anything that still scrolls a locked viewer (momentum, code) gets put back.
-  document.addEventListener('scroll', (e) => {
-    const el = e.target === document ? docScroller() : e.target;
-    if (!locks.has(el)) return;
-    const y = locks.get(el);
-    if (Math.abs(el.scrollTop - y) > 2) el.scrollTop = y;
-  }, true);
+  // ---- Batched scanning of new elements -----------------------------------
+  let pending = [];
+  let timer = 0;
 
-  window.addEventListener('wheel', (e) => {
-    if (isReelScroller(scrollParent(e.target)) && Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
-      e.preventDefault();
-      e.stopImmediatePropagation();
+  function scheduleScan() {
+    if (!timer) timer = setTimeout(runScan, 150);
+  }
+
+  function runScan() {
+    timer = 0;
+    injectStyle();
+    const nodes = pending;
+    pending = [];
+    for (const n of nodes) {
+      if (n.nodeType !== 1 || !n.isConnected) continue;
+      if (HIDE_FEED_REELS) hideFeedReels(n);
+      if (HIDE_APP_BANNER) hideBanners(n);
     }
-  }, { capture: true, passive: false });
+    setLock(findReelScroller());
+  }
 
-  // ---- Start --------------------------------------------------------------
-  check();
-  window.addEventListener('popstate', check);
-  setInterval(check, 250);
-  if (HIDE_APP_BANNER) setInterval(hideAppBanner, 700);
+  new MutationObserver((records) => {
+    for (const r of records) {
+      for (const n of r.addedNodes) if (n.nodeType === 1) pending.push(n);
+    }
+    if (pending.length) scheduleScan();
+  }).observe(document.documentElement, { childList: true, subtree: true });
+
+  // Videos change size/position without DOM changes; re-check the lock occasionally.
+  setInterval(() => { onNavigate(); setLock(findReelScroller()); }, 1000);
+
+  onNavigate();
 })();
 """#
 }
