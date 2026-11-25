@@ -61,6 +61,7 @@ enum FilterScript {
     if (path === lastPath) return;
     const prev = lastPath;
     lastPath = path;
+    locks = new WeakMap();   // new page: forget scroll locks from the previous one
 
     if (REELS_TAB.test(path) || (BLOCK_EXPLORE && path.startsWith('/explore'))) {
       location.replace('/');
@@ -87,22 +88,80 @@ enum FilterScript {
     root.classList.toggle('nr-home', path === '/');
   }
 
-  // ---- Block swiping while a reel is open --------------------------------
-  function allowedTarget(el) {
-    return el && el.closest && el.closest('textarea, input, [contenteditable="true"], [role="dialog"] ul');
+  // ---- Block swiping in the reel viewer ----------------------------------
+  // Works on what is on screen, not the page address: a swipe is blocked when the thing it
+  // would scroll contains a full-screen video (the reel viewer, wherever Instagram opens it).
+  const vh = () => window.innerHeight || document.documentElement.clientHeight;
+  const docScroller = () => document.scrollingElement || document.documentElement;
+
+  function isTyping(el) {
+    return !!(el && el.closest && el.closest('textarea, input, [contenteditable="true"]'));
   }
 
-  let startX = 0, startY = 0;
+  function scrollParent(el) {
+    for (let n = el; n && n.nodeType === 1 && n !== document.body && n !== document.documentElement; n = n.parentElement) {
+      const oy = getComputedStyle(n).overflowY;
+      if ((oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight + 1) return n;
+    }
+    return docScroller();
+  }
+
+  function hasFullScreenVideo(root) {
+    for (const v of root.querySelectorAll('video')) {
+      const r = v.getBoundingClientRect();
+      if (r.height >= vh() * 0.75 && r.bottom > 0 && r.top < vh()) return true;
+    }
+    return false;
+  }
+
+  function isReelScroller(sc) {
+    if (sc === docScroller()) return onReel || hasFullScreenVideo(document);
+    return hasFullScreenVideo(sc);
+  }
+
+  let locks = new WeakMap();   // scroller -> scroll position it must stay at
+  let gesture = null;
+
   window.addEventListener('touchstart', (e) => {
     const t = e.touches[0];
-    if (t) { startX = t.clientX; startY = t.clientY; }
+    if (!t) return;
+    const sc = scrollParent(e.target);
+    const block = !isTyping(e.target) && isReelScroller(sc);
+    if (block) { if (!locks.has(sc)) locks.set(sc, sc.scrollTop); }
+    else locks.delete(sc);
+    gesture = { x: t.clientX, y: t.clientY, block, vertical: false };
   }, { capture: true, passive: true });
 
   window.addEventListener('touchmove', (e) => {
-    if (!onReel || allowedTarget(e.target)) return;
+    if (!gesture || !gesture.block) return;
     const t = e.touches[0];
     if (!t) return;
-    if (Math.abs(t.clientY - startY) > Math.abs(t.clientX - startX)) e.preventDefault();
+    if (Math.abs(t.clientY - gesture.y) > Math.abs(t.clientX - gesture.x)) {
+      gesture.vertical = true;
+      e.preventDefault();               // stop the native scroll
+      e.stopImmediatePropagation();     // stop Instagram's own swipe handling
+    }
+  }, { capture: true, passive: false });
+
+  ['touchend', 'pointermove', 'pointerup'].forEach((type) => {
+    window.addEventListener(type, (e) => {
+      if (gesture && gesture.block && gesture.vertical) e.stopImmediatePropagation();
+    }, true);
+  });
+
+  // Anything that still scrolls a locked viewer (momentum, code) gets put back.
+  document.addEventListener('scroll', (e) => {
+    const el = e.target === document ? docScroller() : e.target;
+    if (!locks.has(el)) return;
+    const y = locks.get(el);
+    if (Math.abs(el.scrollTop - y) > 2) el.scrollTop = y;
+  }, true);
+
+  window.addEventListener('wheel', (e) => {
+    if (isReelScroller(scrollParent(e.target)) && Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    }
   }, { capture: true, passive: false });
 
   // ---- Start --------------------------------------------------------------
