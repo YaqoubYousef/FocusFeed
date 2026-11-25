@@ -30,8 +30,10 @@ struct InstagramWebView: UIViewRepresentable {
         webView.scrollView.backgroundColor = .systemBackground
         webView.underPageBackgroundColor = .systemBackground
 
+        context.coordinator.webView = webView
+
         // Block Instagram/Facebook tracking & logging requests before the first load.
-        let request = URLRequest(url: startURL)
+        let startURL = self.startURL
         WKContentRuleListStore.default().compileContentRuleList(
             forIdentifier: "FocusFeedBlocklist",
             encodedContentRuleList: Blocklist.rules
@@ -40,7 +42,10 @@ struct InstagramWebView: UIViewRepresentable {
                 if let ruleList = ruleList {
                     webView.configuration.userContentController.add(ruleList)
                 }
-                webView.load(request)
+                // Opened by tapping a notification? Go straight to that conversation.
+                let url = DeepLink.pending ?? startURL
+                DeepLink.pending = nil
+                webView.load(URLRequest(url: url))
             }
         }
         return webView
@@ -49,6 +54,30 @@ struct InstagramWebView: UIViewRepresentable {
     func updateUIView(_ webView: WKWebView, context: Context) {}
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
+        weak var webView: WKWebView?
+
+        override init() {
+            super.init()
+            NotificationCenter.default.addObserver(self, selector: #selector(openPendingLink),
+                                                   name: DeepLink.didRequestOpen, object: nil)
+        }
+
+        @objc private func openPendingLink() {
+            DispatchQueue.main.async {
+                guard let webView = self.webView, let url = DeepLink.pending else { return }
+                DeepLink.pending = nil
+                webView.load(URLRequest(url: url))
+            }
+        }
+
+        // After each page load: copy the login cookies and user agent for the background inbox check.
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            InboxChecker.syncCookies()
+            webView.evaluateJavaScript("navigator.userAgent") { result, _ in
+                if let userAgent = result as? String { InboxChecker.saveUserAgent(userAgent) }
+            }
+        }
+
         private let allowedHostSuffixes = [
             "instagram.com", "cdninstagram.com", "facebook.com", "fbcdn.net", "fb.com", "fbsbx.com"
         ]

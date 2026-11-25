@@ -24,6 +24,10 @@ targets:
         NSPhotoLibraryUsageDescription: To send photos and videos in messages.
         NSPhotoLibraryAddUsageDescription: To save photos you choose to download.
         ITSAppUsesNonExemptEncryption: false
+        UIBackgroundModes:
+          - fetch
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.focusfeed.app.inbox-refresh
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.focusfeed.app
