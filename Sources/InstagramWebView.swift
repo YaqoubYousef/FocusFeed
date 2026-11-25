@@ -31,6 +31,7 @@ struct InstagramWebView: UIViewRepresentable {
         webView.underPageBackgroundColor = .systemBackground
 
         context.coordinator.webView = webView
+        context.coordinator.watchPageChanges(of: webView)   // pull-to-refresh where it makes sense
 
         // Block Instagram/Facebook tracking & logging requests before the first load.
         let startURL = self.startURL
@@ -71,7 +72,47 @@ struct InstagramWebView: UIViewRepresentable {
         }
 
         // After each page load: copy the login cookies and user agent for the background inbox check.
+        // MARK: Pull to refresh
+
+        private var urlObservation: NSKeyValueObservation?
+
+        /// Pull-to-refresh is on for the feed and profiles, off in DMs and reels
+        /// (pulling down there should scroll messages, not reload the page).
+        func watchPageChanges(of webView: WKWebView) {
+            urlObservation = webView.observe(\.url, options: [.initial, .new]) { [weak self] webView, _ in
+                DispatchQueue.main.async { self?.updateRefreshControl(for: webView) }
+            }
+        }
+
+        private func updateRefreshControl(for webView: WKWebView) {
+            let path = webView.url?.path ?? "/"
+            let allowed = !(path.hasPrefix("/direct") || path.hasPrefix("/reel") || path.hasPrefix("/stories"))
+            let scrollView = webView.scrollView
+            if allowed && scrollView.refreshControl == nil {
+                let control = UIRefreshControl()
+                control.addTarget(self, action: #selector(pullToRefresh(_:)), for: .valueChanged)
+                scrollView.refreshControl = control
+            } else if !allowed && scrollView.refreshControl != nil {
+                scrollView.refreshControl = nil
+            }
+        }
+
+        @objc private func pullToRefresh(_ control: UIRefreshControl) {
+            webView?.reload()
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            webView.scrollView.refreshControl?.endRefreshing()
+        }
+
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            webView.scrollView.refreshControl?.endRefreshing()
+        }
+
+        // MARK: Page loaded
+
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            webView.scrollView.refreshControl?.endRefreshing()
             InboxChecker.syncCookies()
             webView.evaluateJavaScript("navigator.userAgent") { result, _ in
                 if let userAgent = result as? String { InboxChecker.saveUserAgent(userAgent) }
