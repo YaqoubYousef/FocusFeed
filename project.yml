@@ -16,7 +16,9 @@ targets:
         CFBundleDisplayName: FocusFeed
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
-        UILaunchScreen: {}
+        UILaunchScreen:
+          UIColorName: LaunchBackground
+          UIImageName: LaunchLogo
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
         NSCameraUsageDescription: To take photos and videos to send in messages.
@@ -24,10 +26,6 @@ targets:
         NSPhotoLibraryUsageDescription: To send photos and videos in messages.
         NSPhotoLibraryAddUsageDescription: To save photos you choose to download.
         ITSAppUsesNonExemptEncryption: false
-        UIBackgroundModes:
-          - fetch
-        BGTaskSchedulerPermittedIdentifiers:
-          - com.focusfeed.app.inbox-refresh
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.focusfeed.app

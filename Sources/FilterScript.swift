@@ -1,10 +1,10 @@
 /// JavaScript injected into every Instagram page before it loads.
 /// Edit the settings at the top of the script to change what gets hidden.
 ///
-/// Performance rules this script follows:
-/// - No non-passive touch/scroll listeners on the page (those make every scroll wait for JS).
-/// - No polling of the whole page: only newly added elements are checked, in batches.
-/// - No expensive CSS selectors such as :has().
+/// Rules this script follows:
+/// - Hide things with data-* attributes, never class names (Instagram's React redraws reset classes).
+/// - No non-passive touch/scroll listeners (they make every scroll wait for JS).
+/// - Only re-check the page in small batches after it changes, never scan it constantly.
 enum FilterScript {
     static let source = #"""
 (function () {
@@ -13,24 +13,24 @@ enum FilterScript {
   window.__focusFeed = true;
 
   // ---- Settings -----------------------------------------------------------
-  const BLOCK_EXPLORE = false;      // true = also block the Explore page (mostly reels)
+  const BLOCK_EXPLORE = false;      // true = also block the Explore page
   const HIDE_FEED_REELS = true;     // true = hide reels mixed into the home feed
   const HIDE_APP_BANNER = true;     // true = hide "Open in app" / "Use the app" prompts
   // -------------------------------------------------------------------------
 
-  const REEL_PATH = /^\/reels?\/([A-Za-z0-9_-]+)/;   // /reel/<id> or /reels/<id>
-  const REELS_TAB = /^\/reels\/?$/;                  // the endless Reels feed
+  const native = (msg) => {
+    try { window.webkit.messageHandlers.ff.postMessage(msg); } catch (e) {}
+  };
 
-  let lastPath = null;
-  let allowedReel = null;
-  let onReel = false;
-
-  // ---- Styles (cheap selectors only) --------------------------------------
+  // ---- Styles -------------------------------------------------------------
   const css = `
+    html { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+    a, img, svg, video, [role="button"], button {
+      -webkit-touch-callout: none; -webkit-user-select: none; user-select: none;
+    }
     a[href="/reels/"], a[href^="/reels/?"] { display: none !important; }
-    .ff-hidden { display: none !important; }
-    .ff-locked { overflow: hidden !important; overscroll-behavior: none !important;
-                 touch-action: pan-x pinch-zoom !important; }
+    [data-ff-hide] { display: none !important; }
+    [data-ff-locked] { overflow: hidden !important; overscroll-behavior: none !important; }
     ${BLOCK_EXPLORE ? 'a[href="/explore/"] { display: none !important; }' : ''}
   `;
   function injectStyle() {
@@ -41,39 +41,32 @@ enum FilterScript {
     (document.head || document.documentElement).appendChild(style);
   }
 
+  // No pinch / double-tap zoom, like the app.
+  function fixViewport() {
+    const head = document.head;
+    if (!head) return;
+    let meta = head.querySelector('meta[name="viewport"]');
+    if (!meta) { meta = document.createElement('meta'); meta.name = 'viewport'; head.appendChild(meta); }
+    const want = 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=auto';
+    if (meta.content !== want) meta.content = want;
+  }
+
   // ---- Navigation guard ---------------------------------------------------
+  const REELS_TAB = /^\/reels\/?$/;    // the endless Reels feed
+  let lastPath = null;
+
   function onNavigate() {
     injectStyle();
     const path = location.pathname;
     if (path === lastPath) return;
-    const prev = lastPath;
     lastPath = path;
-
     if (REELS_TAB.test(path) || (BLOCK_EXPLORE && path.startsWith('/explore'))) {
       location.replace('/');
       return;
     }
-
-    const m = path.match(REEL_PATH);
-    if (m) {
-      const id = m[1];
-      const cameFromReel = prev !== null && REEL_PATH.test(prev);
-      if (!cameFromReel || !allowedReel) {
-        allowedReel = id;                                   // opened from a DM, profile, etc.
-      } else if (id !== allowedReel) {
-        location.replace('/reel/' + allowedReel + '/');     // swiped to the next reel
-        return;
-      }
-    } else {
-      allowedReel = null;
-    }
-    onReel = !!m;
-
-    if (HIDE_FEED_REELS && path === '/') hideFeedReels(document);
     scheduleScan();
   }
 
-  // React to Instagram's in-app navigation immediately instead of polling fast.
   ['pushState', 'replaceState'].forEach((fn) => {
     const orig = history[fn];
     history[fn] = function () {
@@ -84,23 +77,96 @@ enum FilterScript {
   });
   window.addEventListener('popstate', onNavigate);
 
-  // ---- Feed reels and "open in app" banners (new elements only) -----------
-  function hideFeedReels(root) {
-    if (location.pathname !== '/') return;          // never on the page of a reel sent to you
-    const links = root.querySelectorAll ? root.querySelectorAll('a[href*="/reel/"]') : [];
-    for (const a of links) {
-      const art = a.closest('article');
-      if (art) art.classList.add('ff-hidden');
-    }
-    if (root.matches && root.matches('a[href*="/reel/"]')) {
-      const art = root.closest('article');
-      if (art) art.classList.add('ff-hidden');
-    }
+  // ---- Reel viewer: keep only the reel you opened ---------------------------
+  // Tapping a reel in a DM opens a full-screen, snap-scrolling list (no address change) that
+  // also holds the chat's other reels and "Suggested" reels. Everything except the reel you
+  // opened is hidden, so there is physically nothing to scroll to.
+  const vh = () => window.innerHeight || document.documentElement.clientHeight;
+
+  function isVerticalSnapScroller(n) {
+    const t = getComputedStyle(n).scrollSnapType;
+    return !!t && t !== 'none' && !/^(x|inline)\b/.test(t);
   }
 
+  function mostVisibleBigVideo(root) {
+    const h = vh();
+    let best = null, bestVisible = 0;
+    for (const v of root.getElementsByTagName('video')) {
+      const r = v.getBoundingClientRect();
+      if (r.height < h * 0.75) continue;
+      const visible = Math.min(r.bottom, h) - Math.max(r.top, 0);
+      if (visible > bestVisible) { bestVisible = visible; best = v; }
+    }
+    return best;
+  }
+
+  function reelItemFor(video, scroller) {
+    let item = video;
+    while (item.parentElement && item.parentElement !== scroller &&
+           getComputedStyle(item).scrollSnapAlign === 'none') item = item.parentElement;
+    return item;
+  }
+
+  let viewer = null;       // the snap-scrolling list
+  let keep = null;         // the one reel left visible
+  let candidate = null;    // reel waiting to be confirmed (Instagram scrolls to it after opening)
+  let candidateAt = 0;
+
+  function releaseViewer() {
+    if (viewer) {
+      viewer.removeAttribute('data-ff-locked');
+      viewer.querySelectorAll('[data-ff-hide]').forEach((n) => n.removeAttribute('data-ff-hide'));
+    }
+    viewer = keep = null;
+  }
+
+  function lockViewer() {
+    if (viewer) {
+      const stillOpen = viewer.isConnected && keep && keep.isConnected && keep.getBoundingClientRect().height > 0;
+      if (!stillOpen) releaseViewer();
+    }
+
+    if (!viewer) {
+      const video = mostVisibleBigVideo(document);
+      if (!video) { candidate = null; return; }
+      let sc = video.parentElement;
+      while (sc && sc !== document.body && !isVerticalSnapScroller(sc)) sc = sc.parentElement;
+      if (!sc || sc === document.body) { candidate = null; return; }
+      const item = reelItemFor(video, sc);
+
+      // Wait until the same reel is still the one on screen a moment later.
+      const now = Date.now();
+      if (candidate !== item) {
+        candidate = item; candidateAt = now;
+        setTimeout(scheduleScan, 260);
+        return;
+      }
+      if (now - candidateAt < 250) { setTimeout(scheduleScan, 260); return; }
+      viewer = sc; keep = item; candidate = null;
+    }
+
+    for (let a = keep; a && a !== viewer && a.parentElement; a = a.parentElement) {
+      for (const sib of a.parentElement.children) {
+        if (sib !== a && !sib.hasAttribute('data-ff-hide')) sib.setAttribute('data-ff-hide', '');
+      }
+    }
+    if (!viewer.hasAttribute('data-ff-locked')) viewer.setAttribute('data-ff-locked', '');
+  }
+
+  // ---- Feed reels ---------------------------------------------------------
+  // Reels in the feed link to /reels/<id>/, /<user>/reel/<id>/ or /reels/audio/<id>/.
+  function hideFeedReels() {
+    if (location.pathname !== '/') return;
+    document.querySelectorAll('article a[href*="/reel/"], article a[href^="/reels/"]').forEach((a) => {
+      const art = a.closest('article');
+      if (art && !art.hasAttribute('data-ff-hide')) art.setAttribute('data-ff-hide', '');
+    });
+  }
+
+  // ---- "Open in app" banners (new elements only) --------------------------
   const APP_LINK = /apps\.apple\.com|itunes\.apple\.com|instagram:\/\/|app\.link|\/download\/?$/i;
   const APP_TEXT = /^(open|use|get|switch to)( the| in)?( instagram)?( app)?$|^open instagram$/i;
-  const NAV_LINKS = 'a[href^="/direct"], a[href="/explore/"], a[href="/accounts/activity/"], nav';
+  const NAV_LINKS = 'a[href^="/direct"], a[href="/explore/"], a[href="/notifications/"], nav';
 
   function hideBannerButton(el) {
     const text = (el.textContent || '').trim();
@@ -112,7 +178,7 @@ enum FilterScript {
       if (p.offsetHeight > 100 || p.querySelector(NAV_LINKS)) break;
       box = p;
     }
-    box.classList.add('ff-hidden');
+    box.setAttribute('data-ff-hide', '');
   }
 
   function hideBanners(root) {
@@ -120,103 +186,65 @@ enum FilterScript {
     if (root.querySelectorAll) root.querySelectorAll('a, button, [role="button"]').forEach(hideBannerButton);
   }
 
-  // ---- Reel viewer lock ---------------------------------------------------
-  // When a full-screen video is on screen, the area that would scroll to the next reel is
-  // locked with CSS (no JS in the scroll path), so swiping does nothing.
-  const vh = () => window.innerHeight || document.documentElement.clientHeight;
-  const docScroller = () => document.scrollingElement || document.documentElement;
+  // ---- Bottom bar: haptics, and Home at the top of the feed = refresh -------
+  function bottomBarLink(target) {
+    const a = target && target.closest && target.closest('a[href]');
+    if (!a) return null;
+    const r = a.getBoundingClientRect();
+    return r.top > vh() - 90 ? a : null;
+  }
 
-  function scrollParent(el) {
-    for (let n = el.parentElement; n && n !== document.body && n !== document.documentElement; n = n.parentElement) {
-      const oy = getComputedStyle(n).overflowY;
-      if ((oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight + 1) return n;
+  window.addEventListener('click', (e) => {
+    const a = bottomBarLink(e.target);
+    if (!a) return;
+    const href = a.getAttribute('href');
+    const scroller = document.scrollingElement || document.documentElement;
+    if (href === '/' && location.pathname === '/' && scroller.scrollTop < 8) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      native({ type: 'refresh' });           // already at the top: refresh, like the app
+      return;
     }
-    return docScroller();
+    native({ type: 'haptic', style: 'light' });
+  }, true);
+
+  // ---- Page background colour -> native safe areas ------------------------
+  let lastBg = '';
+  function reportBackground() {
+    if (!document.body) return;
+    const bg = getComputedStyle(document.body).backgroundColor;
+    if (bg && bg !== lastBg && bg !== 'rgba(0, 0, 0, 0)') { lastBg = bg; native({ type: 'background', color: bg }); }
   }
 
-  function findReelScroller() {
-    const h = vh();
-    for (const v of document.getElementsByTagName('video')) {
-      const r = v.getBoundingClientRect();
-      if (r.height >= h * 0.75 && r.bottom > 0 && r.top < h) return scrollParent(v);
-    }
-    return onReel ? docScroller() : null;
-  }
-
-  let locked = null;
-  let lockPos = 0;
-
-  function lockTargets(el) {
-    return el === docScroller() ? [document.documentElement, document.body] : [el];
-  }
-
-  function setLock(el) {
-    if (el === locked) return;
-    if (locked) lockTargets(locked).forEach((t) => t && t.classList.remove('ff-locked'));
-    locked = el;
-    if (el) {
-      lockPos = el.scrollTop;
-      lockTargets(el).forEach((t) => t && t.classList.add('ff-locked'));
-    }
-  }
-
-  // Momentum or code that still moves a locked viewer gets put back (passive, cheap).
-  document.addEventListener('scroll', (e) => {
-    if (!locked) return;
-    const el = e.target === document ? docScroller() : e.target;
-    if (el === locked && Math.abs(el.scrollTop - lockPos) > 2) el.scrollTop = lockPos;
-  }, { capture: true, passive: true });
-
-  // Stop Instagram's own JS swipe handling while locked (passive: never delays scrolling).
-  let gesture = null;
-  window.addEventListener('touchstart', (e) => {
-    if (!locked) { gesture = null; return; }
-    const t = e.touches[0];
-    const inLocked = locked === docScroller() || locked.contains(e.target);
-    gesture = t && inLocked ? { x: t.clientX, y: t.clientY, vertical: false } : null;
-  }, { capture: true, passive: true });
-
-  ['touchmove', 'touchend', 'pointermove', 'pointerup'].forEach((type) => {
-    window.addEventListener(type, (e) => {
-      if (!gesture) return;
-      if (type === 'touchmove' && e.touches[0]) {
-        const t = e.touches[0];
-        if (Math.abs(t.clientY - gesture.y) > Math.abs(t.clientX - gesture.x) + 4) gesture.vertical = true;
-      }
-      if (gesture.vertical) e.stopImmediatePropagation();
-    }, { capture: true, passive: true });
-  });
-
-  // ---- Batched scanning of new elements -----------------------------------
+  // ---- Batched scanning ---------------------------------------------------
   let pending = [];
   let timer = 0;
 
   function scheduleScan() {
-    if (!timer) timer = setTimeout(runScan, 150);
+    if (!timer) timer = setTimeout(runScan, 120);
   }
 
   function runScan() {
     timer = 0;
     injectStyle();
+    fixViewport();
     const nodes = pending;
     pending = [];
-    for (const n of nodes) {
-      if (n.nodeType !== 1 || !n.isConnected) continue;
-      if (HIDE_FEED_REELS) hideFeedReels(n);
-      if (HIDE_APP_BANNER) hideBanners(n);
+    if (HIDE_APP_BANNER) {
+      for (const n of nodes) if (n.nodeType === 1 && n.isConnected) hideBanners(n);
     }
-    setLock(findReelScroller());
+    if (HIDE_FEED_REELS) hideFeedReels();
+    lockViewer();
+    reportBackground();
   }
 
   new MutationObserver((records) => {
-    for (const r of records) {
-      for (const n of r.addedNodes) if (n.nodeType === 1) pending.push(n);
-    }
+    for (const r of records) for (const n of r.addedNodes) if (n.nodeType === 1) pending.push(n);
     if (pending.length) scheduleScan();
   }).observe(document.documentElement, { childList: true, subtree: true });
 
-  // Videos change size/position without DOM changes; re-check the lock occasionally.
-  setInterval(() => { onNavigate(); setLock(findReelScroller()); }, 1000);
+  // Videos can grow/move without DOM changes; light re-check once a second.
+  setInterval(() => { onNavigate(); lockViewer(); reportBackground(); }, 1000);
 
   onNavigate();
 })();

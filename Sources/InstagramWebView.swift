@@ -4,8 +4,14 @@ import WebKit
 /// Full-screen Instagram website with Reels scrolling and "open in app" prompts removed.
 struct InstagramWebView: UIViewRepresentable {
     let startURL: URL
+    /// The page's background colour, so the status-bar and home-indicator areas match it.
+    var onBackgroundColor: (UIColor) -> Void = { _ in }
+    /// Called once, when the first page has loaded (fades out the splash screen).
+    var onFirstLoad: () -> Void = {}
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onBackgroundColor: onBackgroundColor, onFirstLoad: onFirstLoad)
+    }
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
@@ -15,10 +21,11 @@ struct InstagramWebView: UIViewRepresentable {
         // Look like mobile Safari so Instagram serves its normal mobile site.
         config.applicationNameForUserAgent = "Version/18.0 Mobile/15E148 Safari/604.1"
 
-        let script = WKUserScript(source: FilterScript.source,
-                                  injectionTime: .atDocumentStart,
-                                  forMainFrameOnly: true)
-        config.userContentController.addUserScript(script)
+        let controller = config.userContentController
+        controller.addUserScript(WKUserScript(source: FilterScript.source,
+                                              injectionTime: .atDocumentStart,
+                                              forMainFrameOnly: true))
+        controller.add(WeakScriptHandler(context.coordinator), name: "ff")
 
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
@@ -26,9 +33,11 @@ struct InstagramWebView: UIViewRepresentable {
         webView.allowsBackForwardNavigationGestures = true   // swipe from the edge to go back
         webView.allowsLinkPreview = false                    // no long-press previews popping up
         webView.isOpaque = true                              // opaque views draw faster
-        webView.backgroundColor = .systemBackground
-        webView.scrollView.backgroundColor = .systemBackground
-        webView.underPageBackgroundColor = .systemBackground
+        let background = UIColor(named: "LaunchBackground") ?? .systemBackground
+        webView.backgroundColor = background
+        webView.scrollView.backgroundColor = background
+        webView.underPageBackgroundColor = background
+        webView.scrollView.pinchGestureRecognizer?.isEnabled = false
 
         context.coordinator.webView = webView
         context.coordinator.watchPageChanges(of: webView)   // pull-to-refresh where it makes sense
@@ -43,10 +52,7 @@ struct InstagramWebView: UIViewRepresentable {
                 if let ruleList = ruleList {
                     webView.configuration.userContentController.add(ruleList)
                 }
-                // Opened by tapping a notification? Go straight to that conversation.
-                let url = DeepLink.pending ?? startURL
-                DeepLink.pending = nil
-                webView.load(URLRequest(url: url))
+                webView.load(URLRequest(url: startURL))
             }
         }
         return webView
@@ -54,25 +60,48 @@ struct InstagramWebView: UIViewRepresentable {
 
     func updateUIView(_ webView: WKWebView, context: Context) {}
 
-    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
         weak var webView: WKWebView?
+        private let onBackgroundColor: (UIColor) -> Void
+        private var onFirstLoad: (() -> Void)?
+        private let lightTap = UIImpactFeedbackGenerator(style: .light)
+        private let mediumTap = UIImpactFeedbackGenerator(style: .medium)
 
-        override init() {
+        init(onBackgroundColor: @escaping (UIColor) -> Void, onFirstLoad: @escaping () -> Void) {
+            self.onBackgroundColor = onBackgroundColor
+            self.onFirstLoad = onFirstLoad
             super.init()
-            NotificationCenter.default.addObserver(self, selector: #selector(openPendingLink),
-                                                   name: DeepLink.didRequestOpen, object: nil)
+            // Never leave the splash up forever if Instagram is slow.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in self?.finishFirstLoad() }
         }
 
-        @objc private func openPendingLink() {
-            DispatchQueue.main.async {
-                guard let webView = self.webView, let url = DeepLink.pending else { return }
-                DeepLink.pending = nil
-                webView.load(URLRequest(url: url))
+        private func finishFirstLoad() {
+            onFirstLoad?()
+            onFirstLoad = nil
+        }
+
+        // MARK: Messages from the page script
+
+        func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard let body = message.body as? [String: Any], let type = body["type"] as? String else { return }
+            switch type {
+            case "haptic":
+                lightTap.impactOccurred()
+            case "refresh":
+                refreshWithSpinner()
+            case "background":
+                if let css = body["color"] as? String, let color = UIColor(cssRGB: css) {
+                    webView?.backgroundColor = color
+                    webView?.scrollView.backgroundColor = color
+                    webView?.underPageBackgroundColor = color
+                    onBackgroundColor(color)
+                }
+            default:
+                break
             }
         }
 
-        // After each page load: copy the login cookies and user agent for the background inbox check.
-        // MARK: Pull to refresh
+        // MARK: Refresh (pull down, or tap Home at the top of the feed)
 
         private var urlObservation: NSKeyValueObservation?
 
@@ -98,26 +127,45 @@ struct InstagramWebView: UIViewRepresentable {
         }
 
         @objc private func pullToRefresh(_ control: UIRefreshControl) {
+            mediumTap.impactOccurred()
             webView?.reload()
+        }
+
+        private func refreshWithSpinner() {
+            guard let webView = webView else { return }
+            mediumTap.impactOccurred()
+            let scrollView = webView.scrollView
+            if let control = scrollView.refreshControl, !control.isRefreshing {
+                control.beginRefreshing()
+                let top = scrollView.adjustedContentInset.top
+                scrollView.setContentOffset(CGPoint(x: 0, y: -(top + control.frame.height)), animated: true)
+            }
+            webView.reload()
+        }
+
+        // MARK: Page loading
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            webView.scrollView.refreshControl?.endRefreshing()
+            finishFirstLoad()
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
             webView.scrollView.refreshControl?.endRefreshing()
+            finishFirstLoad()
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
             webView.scrollView.refreshControl?.endRefreshing()
+            finishFirstLoad()
         }
 
-        // MARK: Page loaded
-
-        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            webView.scrollView.refreshControl?.endRefreshing()
-            InboxChecker.syncCookies()
-            webView.evaluateJavaScript("navigator.userAgent") { result, _ in
-                if let userAgent = result as? String { InboxChecker.saveUserAgent(userAgent) }
-            }
+        // Reload if the web content process gets killed in the background.
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            webView.reload()
         }
+
+        // MARK: Where links may go
 
         private let allowedHostSuffixes = [
             "instagram.com", "cdninstagram.com", "facebook.com", "fbcdn.net", "fb.com", "fbsbx.com"
@@ -177,10 +225,30 @@ struct InstagramWebView: UIViewRepresentable {
             }
             return nil
         }
+    }
+}
 
-        // Reload if the web content process gets killed in the background.
-        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-            webView.reload()
-        }
+/// Avoids a retain cycle between the web view's content controller and the coordinator.
+final class WeakScriptHandler: NSObject, WKScriptMessageHandler {
+    private weak var target: WKScriptMessageHandler?
+
+    init(_ target: WKScriptMessageHandler) {
+        self.target = target
+    }
+
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        target?.userContentController(controller, didReceive: message)
+    }
+}
+
+extension UIColor {
+    /// Parses "rgb(12, 16, 20)" or "rgba(12, 16, 20, 1)".
+    convenience init?(cssRGB: String) {
+        let numbers = cssRGB
+            .components(separatedBy: CharacterSet(charactersIn: "0123456789.").inverted)
+            .compactMap { Double($0) }
+        guard numbers.count >= 3 else { return nil }
+        let alpha = numbers.count >= 4 ? numbers[3] : 1
+        self.init(red: numbers[0] / 255, green: numbers[1] / 255, blue: numbers[2] / 255, alpha: alpha)
     }
 }

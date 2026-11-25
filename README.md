@@ -48,12 +48,7 @@ With a free Apple ID the app **stops opening after 7 days**. Re-install it with 
 
 ## DM notifications
 
-FocusFeed checks your inbox in the background and notifies you about new messages
-(tap one to open that conversation). To make it work:
-
-- Allow notifications when the app asks.
-- **Settings → Apps → FocusFeed → Background App Refresh → On**.
-- Don't swipe FocusFeed away in the app switcher; iOS won't wake an app you've closed that way.
-
-iOS decides when checks run, usually every 15 minutes to a few hours, more often if you
-open the app regularly. Low Power Mode pauses them.
+FocusFeed can't show DM notifications. Instagram's website no longer offers the inbox request
+a background check would need, and real push notifications require a paid Apple developer
+account plus a server. For instant message alerts, keep the official Instagram app installed
+with only message notifications on, hidden in the App Library and limited with Screen Time.
