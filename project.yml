@@ -1,0 +1,35 @@
+name: FocusFeed
+options:
+  bundleIdPrefix: com.focusfeed
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  FocusFeed:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+      - Resources
+    info:
+      path: Generated/Info.plist
+      properties:
+        CFBundleDisplayName: FocusFeed
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSCameraUsageDescription: To take photos and videos to send in messages.
+        NSMicrophoneUsageDescription: To record voice and video messages.
+        NSPhotoLibraryUsageDescription: To send photos and videos in messages.
+        NSPhotoLibraryAddUsageDescription: To save photos you choose to download.
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.focusfeed.app
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGNING_ALLOWED: "NO"

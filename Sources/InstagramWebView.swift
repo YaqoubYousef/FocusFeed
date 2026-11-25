@@ -1,0 +1,101 @@
+import SwiftUI
+import WebKit
+
+/// Full-screen Instagram website with Reels scrolling and "open in app" prompts removed.
+struct InstagramWebView: UIViewRepresentable {
+    let startURL: URL
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .default()                 // keeps you logged in
+        config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = []
+        // Look like mobile Safari so Instagram serves its normal mobile site.
+        config.applicationNameForUserAgent = "Version/18.0 Mobile/15E148 Safari/604.1"
+
+        let script = WKUserScript(source: FilterScript.source,
+                                  injectionTime: .atDocumentStart,
+                                  forMainFrameOnly: true)
+        config.userContentController.addUserScript(script)
+
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = context.coordinator
+        webView.uiDelegate = context.coordinator
+        webView.allowsBackForwardNavigationGestures = true   // swipe from the edge to go back
+        webView.isOpaque = false
+        webView.backgroundColor = .systemBackground
+        webView.scrollView.backgroundColor = .systemBackground
+        webView.load(URLRequest(url: startURL))
+        return webView
+    }
+
+    func updateUIView(_ webView: WKWebView, context: Context) {}
+
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
+        private let allowedHostSuffixes = [
+            "instagram.com", "cdninstagram.com", "facebook.com", "fbcdn.net", "fb.com", "fbsbx.com"
+        ]
+
+        private func isAllowedHost(_ host: String?) -> Bool {
+            guard let host = host?.lowercased() else { return false }
+            return allowedHostSuffixes.contains { host == $0 || host.hasSuffix("." + $0) }
+        }
+
+        func webView(_ webView: WKWebView,
+                     decidePolicyFor action: WKNavigationAction,
+                     decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            guard let url = action.request.url else { return decisionHandler(.cancel) }
+            let scheme = url.scheme?.lowercased() ?? ""
+
+            // instagram://, itms-apps://, intent:// … = attempts to open the real app or App Store.
+            if scheme != "http" && scheme != "https" && scheme != "about" && scheme != "blob" && scheme != "data" {
+                return decisionHandler(.cancel)
+            }
+
+            let isMainFrame = action.targetFrame?.isMainFrame ?? true
+            guard isMainFrame, scheme == "http" || scheme == "https" else {
+                return decisionHandler(.allow)
+            }
+
+            // The endless Reels feed -> back to the home feed.
+            let path = url.path
+            if isAllowedHost(url.host) && (path == "/reels" || path == "/reels/") {
+                decisionHandler(.cancel)
+                webView.load(URLRequest(url: URL(string: "https://www.instagram.com/")!))
+                return
+            }
+
+            // External links (and App Store links) open in Safari instead of inside the app.
+            if !isAllowedHost(url.host) {
+                if !(url.host ?? "").contains("apple.com") {
+                    UIApplication.shared.open(url)
+                }
+                return decisionHandler(.cancel)
+            }
+
+            decisionHandler(.allow)
+        }
+
+        // Links that try to open a new window/tab.
+        func webView(_ webView: WKWebView,
+                     createWebViewWith configuration: WKWebViewConfiguration,
+                     for action: WKNavigationAction,
+                     windowFeatures: WKWindowFeatures) -> WKWebView? {
+            if let url = action.request.url {
+                if isAllowedHost(url.host) {
+                    webView.load(URLRequest(url: url))
+                } else if url.scheme == "http" || url.scheme == "https" {
+                    UIApplication.shared.open(url)
+                }
+            }
+            return nil
+        }
+
+        // Reload if the web content process gets killed in the background.
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            webView.reload()
+        }
+    }
+}
